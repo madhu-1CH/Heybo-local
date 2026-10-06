@@ -11,7 +11,8 @@ Constraints:
   - category slot min/max (normal, with only overflowing Include/Extra
     categories raised to the asked count up to customization max; or
     normal min + customization max when expanding for nutrient mins)
-  - current nutrient Min/Max bands; equal Min==Max is strict-then-relax
+  - current nutrient Min/Max bands; equal Min==Max is strict-then-relax.
+    A real Min–Max range uses that full requested band directly.
   - global max bowl weight, with soft overshoot
   - Price Min/Max (BYB base + sum of default-category ai_price; slack from
     ``PRICE_RELAXATION_SLACKS`` — no Salad +$2 / .50/.90 rounding)
@@ -72,8 +73,6 @@ from .pricing import (
 )
 
 _NUTRIENT_SCALE = 1000
-_NUTRIENT_SPREAD_MIN_SPAN = 8.0
-_NUTRIENT_SPREAD_WINDOW_FRAC = 0.35
 _CPSAT_EQUAL_POINT_TIGHT_FRAC = 1.0 / 3.0
 
 _WEIGHT_DRIFT_G = 5
@@ -431,10 +430,11 @@ def _equal_point_strict_nutrient_windows(
 def _min_anchored_nutrient_windows(
     nutrient_filters: list[dict] | None,
 ) -> dict[str, tuple[float, float]]:
+    """Middle pass for an exact Min==Max only. A real range stays on the full band."""
     overrides: dict[str, tuple[float, float]] = {}
     for nf in nutrient_filters or []:
         key = _resolve_nutrient_filter_key(str(nf.get("Nutrient") or "").strip())
-        if not key:
+        if not key or not _cpsat_filter_is_equal_point(nf):
             continue
         rng = nf.get("Range") or {}
         min_raw, max_raw = rng.get("Min"), rng.get("Max")
@@ -446,31 +446,10 @@ def _min_anchored_nutrient_windows(
             continue
         if hi <= lo + 1e-6:
             continue
-        if _cpsat_filter_is_equal_point(nf):
-            tight_hi = min(hi, lo + _cpsat_equal_point_tight_slack(key))
-        else:
-            span = hi - lo
-            if span < _NUTRIENT_SPREAD_MIN_SPAN:
-                continue
-            window = max(span * _NUTRIENT_SPREAD_WINDOW_FRAC, min(5.0, span))
-            window = min(window, span)
-            tight_hi = lo + window
+        tight_hi = min(hi, lo + _cpsat_equal_point_tight_slack(key))
         if tight_hi >= hi - 1e-6 or tight_hi <= lo + 1e-6:
             continue
         overrides[key] = (lo, tight_hi)
-    return overrides
-
-
-def _random_category_count_targets(
-    limits: dict[str, tuple[int, int]],
-) -> dict[str, tuple[int, int]]:
-    overrides: dict[str, tuple[int, int]] = {}
-    for cat, (cmin, cmax) in (limits or {}).items():
-        lo, hi = int(cmin), int(cmax)
-        if hi <= lo:
-            continue
-        n = random.randint(lo, hi)
-        overrides[cat] = (n, n)
     return overrides
 
 
@@ -1567,6 +1546,7 @@ def search_feasible_bowls_cpsat(
     cuisine_matched_names: set[str] | list[str] | None = None,
     only_exact_bowl: bool = False,
     customization_category_limits: dict | None = None,
+    model_session: dict | None = None,
     **kwargs,
 ) -> tuple[list[dict], str]:
     try:
@@ -1810,8 +1790,44 @@ def search_feasible_bowls_cpsat(
         nutrient_filters = []
         dbg_print("[CP-SAT] Only exact: skipping nutrient / price / CO2e / Light-Hearty mins")
 
-    # One model per search. Retries switch bound assumptions and append forbids.
-    _cpsat_model: dict[str, Any] = {}
+    # One model per search. A later relaxation reuses it when only bounds change.
+    def _structural_key() -> tuple:
+        nutrient_keys = tuple(sorted(
+            str(_resolve_nutrient_filter_key(str(nf.get("Nutrient") or "").strip()) or "")
+            for nf in (nutrient_filters or [])
+        ))
+        pool_key = tuple(
+            (cat, tuple(pools.get(cat) or []))
+            for cat in _CPSAT_CATEGORIES
+        )
+        limit_key = tuple(sorted((str(k), int(v[0]), int(v[1])) for k, v in (limits or {}).items()))
+        return (
+            bool(only_exact_bowl),
+            bool(expand_to_customization_max),
+            pool_key,
+            limit_key,
+            tuple(sorted(exclude_set)),
+            tuple(sorted((str(k), int(v)) for k, v in (portion_req or {}).items())),
+            tuple(sorted(
+                (str(a), tuple(sorted(str(b) for b in (bad or []))))
+                for a, bad in (incompatible_pairs or {}).items()
+            )),
+            bool(_cuisine_filters_requested(user_input)),
+            bool(_flavor_preferences_requested(user_input, flavor_preferences)),
+            bool(_prep_method_requested(user_input)),
+            tuple(sorted(true_cuisine_names or [])),
+            tuple(sorted(true_flavor_names or [])),
+            tuple(sorted(true_prep_names or [])),
+            tuple(sorted(preferred_proteins or [])),
+            tuple(sorted(few_forced_names or [])),
+            nutrient_keys,
+        )
+
+    _structural_key_value = _structural_key()
+    _saved_model = None
+    if model_session is not None:
+        _saved_model = (model_session.get("by_key") or {}).get(_structural_key_value)
+    _cpsat_model: dict[str, Any] = _saved_model if _saved_model is not None else {}
 
     def _enforce(ct, gate):
         if gate is not None:
@@ -1819,10 +1835,10 @@ def search_feasible_bowls_cpsat(
         return ct
 
     def _build_structural_model():
-        """Variables and constraints that do not change between retries.
+        """Variables and constraints that do not change across relaxation.
 
-        Full nutrient bands and full category limits are hard constraints.
-        Tighter windows are added later behind assumption literals.
+        Nutrient, price, CO2e, and weight bounds are applied later on a switch
+        so a wider limit can be selected without building a new model.
         """
         model = cp_model.CpModel()
         vars_by_slot: dict[tuple[str, str], Any] = {}
@@ -1892,85 +1908,22 @@ def search_feasible_bowls_cpsat(
             if required_sides > 0 and (warm_vars or cold_vars):
                 model.Add(sum(warm_vars) + sum(cold_vars) >= int(required_sides))
 
-        for nf in nutrient_filters or []:
-            key = _resolve_nutrient_filter_key(str(nf.get("Nutrient") or "").strip())
-            if not key:
-                continue
-            rng = nf.get("Range") or {}
-            min_raw = rng.get("Min")
-            max_raw = rng.get("Max")
-            scaled_min, scaled_max = _scaled_nutrient_bounds(min_raw, max_raw, drift)
-            coeff: list[tuple[Any, int]] = []
-            for (_cat, ing), var in vars_by_slot.items():
-                scaled = _ingredient_nutrient_scaled(df, ing, key)
-                if scaled:
-                    coeff.append((var, scaled))
-            _cpsat_model.setdefault("nutrient_coeff", {})[key] = coeff
-            total_expr = sum(c * v for v, c in coeff) if coeff else 0
-            if scaled_min is not None and float(min_raw or 0) > 0:
-                if not coeff:
-                    return (
-                        f"CP-SAT infeasible: no menu ingredient contributes to {key} "
-                        f"but Min={min_raw}"
-                    )
-                model.Add(total_expr >= scaled_min)
-            if scaled_max is not None:
-                if not coeff:
-                    continue
-                model.Add(total_expr <= scaled_max)
-
-        hard_weight_hi = global_max_weight_g
-        if weight_hi is not None:
-            hard_weight_hi = min(hard_weight_hi, float(weight_hi))
-        solver_weight_hi = hard_weight_hi + _WEIGHT_TRIM_SLACK_G
-        if weight_lo is not None or solver_weight_hi > 0:
-            weight_terms: list[tuple[Any, int]] = []
-            for (_cat, ing), var in vars_by_slot.items():
-                grams = _ingredient_weight_g(df, ing)
-                if grams:
-                    weight_terms.append((var, grams))
-            if not weight_terms and weight_lo is not None and weight_lo > 0:
-                return (
-                    "CP-SAT infeasible: Light/Hearty weight Min set but no ingredient weights in menu"
-                )
-            weight_expr = sum(g * v for v, g in weight_terms) if weight_terms else 0
-            if weight_lo is not None:
-                model.Add(weight_expr >= max(0, int(round(weight_lo)) - _WEIGHT_DRIFT_G))
-            model.Add(weight_expr <= int(round(solver_weight_hi)) + _WEIGHT_DRIFT_G)
-
-        if co2e_min_scaled is not None or co2e_max_scaled is not None:
-            co2e_terms: list[tuple[Any, int]] = []
-            for (_cat, ing), var in vars_by_slot.items():
-                scaled = _ingredient_co2e_scaled(df, ing)
-                if scaled:
-                    co2e_terms.append((var, scaled))
-            if co2e_min_scaled is not None and co2e_min_scaled > 0 and not co2e_terms:
-                return (
-                    "CP-SAT infeasible: Sustainable CO2e Min set but no CO2e data in menu pool"
-                )
-            if co2e_terms:
-                co2e_expr = sum(c * v for v, c in co2e_terms)
-                if co2e_min_scaled is not None:
-                    model.Add(co2e_expr >= co2e_min_scaled)
-                if co2e_max_scaled is not None:
-                    model.Add(co2e_expr <= co2e_max_scaled)
-
-        if price_min_cents is not None or price_max_cents is not None:
-            price_terms: list[tuple[Any, int]] = []
-            for (cat, ing), var in vars_by_slot.items():
-                cents = _ingredient_price_cents(df, ing, cat)
-                if cents:
-                    price_terms.append((var, cents))
-            if price_min_cents is not None and price_min_cents > 0 and not price_terms:
-                return (
-                    "CP-SAT infeasible: Price Min set but no ai_price data in menu pool"
-                )
-            if price_terms:
-                price_expr = sum(c * v for v, c in price_terms)
-                if price_min_cents is not None:
-                    model.Add(price_expr >= price_min_cents)
-                if price_max_cents is not None:
-                    model.Add(price_expr <= price_max_cents)
+        weight_terms: list[tuple[Any, int]] = []
+        co2e_terms: list[tuple[Any, int]] = []
+        price_terms: list[tuple[Any, int]] = []
+        for (cat, ing), var in vars_by_slot.items():
+            grams = _ingredient_weight_g(df, ing)
+            if grams:
+                weight_terms.append((var, grams))
+            scaled = _ingredient_co2e_scaled(df, ing)
+            if scaled:
+                co2e_terms.append((var, scaled))
+            cents = _ingredient_price_cents(df, ing, cat)
+            if cents:
+                price_terms.append((var, cents))
+        _cpsat_model["weight_terms"] = weight_terms
+        _cpsat_model["co2e_terms"] = co2e_terms
+        _cpsat_model["price_terms"] = price_terms
 
         seen_pairs: set[tuple[str, str]] = set()
         for ing_a, bad in incompatible_pairs.items():
@@ -2053,6 +2006,14 @@ def search_feasible_bowls_cpsat(
         _cpsat_model["dead_bound_gates"] = []
         _cpsat_model["div_gates"] = []
         _cpsat_model["posted_forbids"] = set()
+        _cpsat_model["relaxation_cache"] = {}
+        _cpsat_model["relaxation_gates"] = []
+        _cpsat_model["dead_relaxation_gates"] = []
+        _cpsat_model["active_relaxation_gate"] = None
+        _cpsat_model["search_gates"] = []
+        _cpsat_model["active_search_gate"] = None
+        if model_session is not None:
+            model_session.setdefault("by_key", {})[_structural_key_value] = _cpsat_model
         return None
 
     def _nutrient_coeff(key: str) -> list[tuple[Any, int]]:
@@ -2066,6 +2027,114 @@ def search_feasible_bowls_cpsat(
                 coeff.append((var, scaled))
         cache[key] = coeff
         return coeff
+
+    def _relaxation_signature() -> tuple:
+        parts = []
+        for nf in nutrient_filters or []:
+            key = _resolve_nutrient_filter_key(str(nf.get("Nutrient") or "").strip())
+            rng = nf.get("Range") or {}
+            parts.append((str(key or ""), str(rng.get("Min")), str(rng.get("Max"))))
+        return (
+            tuple(parts),
+            price_min_cents,
+            price_max_cents,
+            co2e_min_scaled,
+            co2e_max_scaled,
+            None if weight_lo is None else float(weight_lo),
+            None if weight_hi is None else float(weight_hi),
+            float(global_max_weight_g),
+        )
+
+    def _apply_relaxation_bounds(gate) -> str | None:
+        """Current price, nutrient, CO2e, and weight limits, behind one switch."""
+        model = _cpsat_model["model"]
+        for nf in nutrient_filters or []:
+            key = _resolve_nutrient_filter_key(str(nf.get("Nutrient") or "").strip())
+            if not key:
+                continue
+            rng = nf.get("Range") or {}
+            min_raw = rng.get("Min")
+            max_raw = rng.get("Max")
+            scaled_min, scaled_max = _scaled_nutrient_bounds(min_raw, max_raw, drift)
+            coeff = _nutrient_coeff(key)
+            total_expr = sum(c * v for v, c in coeff) if coeff else 0
+            if scaled_min is not None and float(min_raw or 0) > 0:
+                if not coeff:
+                    return (
+                        f"CP-SAT infeasible: no menu ingredient contributes to {key} "
+                        f"but Min={min_raw}"
+                    )
+                _enforce(model.Add(total_expr >= scaled_min), gate)
+            if scaled_max is not None and coeff:
+                _enforce(model.Add(total_expr <= scaled_max), gate)
+
+        hard_weight_hi = global_max_weight_g
+        if weight_hi is not None:
+            hard_weight_hi = min(hard_weight_hi, float(weight_hi))
+        solver_weight_hi = hard_weight_hi + _WEIGHT_TRIM_SLACK_G
+        weight_terms = _cpsat_model.get("weight_terms") or []
+        if weight_lo is not None or solver_weight_hi > 0:
+            if not weight_terms and weight_lo is not None and weight_lo > 0:
+                return (
+                    "CP-SAT infeasible: Light/Hearty weight Min set but no ingredient weights in menu"
+                )
+            weight_expr = sum(g * v for v, g in weight_terms) if weight_terms else 0
+            if weight_lo is not None:
+                _enforce(
+                    model.Add(weight_expr >= max(0, int(round(weight_lo)) - _WEIGHT_DRIFT_G)),
+                    gate,
+                )
+            _enforce(
+                model.Add(weight_expr <= int(round(solver_weight_hi)) + _WEIGHT_DRIFT_G),
+                gate,
+            )
+
+        co2e_terms = _cpsat_model.get("co2e_terms") or []
+        if co2e_min_scaled is not None or co2e_max_scaled is not None:
+            if co2e_min_scaled is not None and co2e_min_scaled > 0 and not co2e_terms:
+                return (
+                    "CP-SAT infeasible: Sustainable CO2e Min set but no CO2e data in menu pool"
+                )
+            if co2e_terms:
+                co2e_expr = sum(c * v for v, c in co2e_terms)
+                if co2e_min_scaled is not None:
+                    _enforce(model.Add(co2e_expr >= co2e_min_scaled), gate)
+                if co2e_max_scaled is not None:
+                    _enforce(model.Add(co2e_expr <= co2e_max_scaled), gate)
+
+        price_terms = _cpsat_model.get("price_terms") or []
+        if price_min_cents is not None or price_max_cents is not None:
+            if price_min_cents is not None and price_min_cents > 0 and not price_terms:
+                return (
+                    "CP-SAT infeasible: Price Min set but no ai_price data in menu pool"
+                )
+            if price_terms:
+                price_expr = sum(c * v for v, c in price_terms)
+                if price_min_cents is not None:
+                    _enforce(model.Add(price_expr >= price_min_cents), gate)
+                if price_max_cents is not None:
+                    _enforce(model.Add(price_expr <= price_max_cents), gate)
+        return None
+
+    def _ensure_relaxation_bounds() -> str | None:
+        cache = _cpsat_model.setdefault("relaxation_cache", {})
+        key = _relaxation_signature()
+        if key in cache:
+            gate, err = cache[key]
+            _cpsat_model["active_relaxation_gate"] = gate
+            return err
+        model = _cpsat_model["model"]
+        gate = model.NewBoolVar(f"relax_{len(cache)}")
+        err = _apply_relaxation_bounds(gate)
+        if err:
+            _cpsat_model.setdefault("dead_relaxation_gates", []).append(gate)
+            cache[key] = (None, err)
+            _cpsat_model["active_relaxation_gate"] = None
+            return err
+        _cpsat_model.setdefault("relaxation_gates", []).append(gate)
+        cache[key] = (gate, None)
+        _cpsat_model["active_relaxation_gate"] = gate
+        return None
 
     def _resolved_category_bounds(cat: str, cmin: int, cmax: int):
         vars_by_category = _cpsat_model["vars_by_category"]
@@ -2169,9 +2238,25 @@ def search_feasible_bowls_cpsat(
                     obj_terms.append(weight * present_by_ingredient[name])
         return obj_terms
 
+    _search_gate = {"value": None}
+
+    def _current_search_gate():
+        """One switch per search. A later relaxation turns the previous rejects off."""
+        if _search_gate["value"] is not None:
+            return _search_gate["value"]
+        model = _cpsat_model["model"]
+        gates = _cpsat_model.setdefault("search_gates", [])
+        gate = model.NewBoolVar(f"search_{len(gates)}")
+        gates.append(gate)
+        _search_gate["value"] = gate
+        _cpsat_model["active_search_gate"] = gate
+        _cpsat_model["posted_forbids"] = set()
+        return gate
+
     def _append_forbidden_sets() -> None:
         model = _cpsat_model["model"]
         present_by_ingredient = _cpsat_model["present_by_ingredient"]
+        gate = _current_search_gate()
         posted = _cpsat_model["posted_forbids"]
         for chosen in chosen_sets:
             present = [ing for ing in chosen if ing in present_by_ingredient]
@@ -2181,8 +2266,11 @@ def search_feasible_bowls_cpsat(
             if key in posted:
                 continue
             posted.add(key)
-            model.Add(
-                sum(present_by_ingredient[ing] for ing in present) <= len(present) - 1
+            _enforce(
+                model.Add(
+                    sum(present_by_ingredient[ing] for ing in present) <= len(present) - 1
+                ),
+                gate,
             )
 
     def _active_assumptions(bound_lits, div_gate) -> list[Any]:
@@ -2196,6 +2284,20 @@ def search_feasible_bowls_cpsat(
             lits.append(gate.Not())
         for gate in _cpsat_model["div_gates"]:
             lits.append(gate.Not())
+        relax_gate = _cpsat_model.get("active_relaxation_gate")
+        if relax_gate is not None:
+            lits.append(relax_gate)
+        for gate in _cpsat_model.get("relaxation_gates") or []:
+            if gate is not relax_gate:
+                lits.append(gate.Not())
+        for gate in _cpsat_model.get("dead_relaxation_gates") or []:
+            lits.append(gate.Not())
+        search_gate = _cpsat_model.get("active_search_gate")
+        if search_gate is not None:
+            lits.append(search_gate)
+        for gate in _cpsat_model.get("search_gates") or []:
+            if gate is not search_gate:
+                lits.append(gate.Not())
         return lits
 
     def _forbid_protein_sauce_pair(
@@ -2469,16 +2571,15 @@ def search_feasible_bowls_cpsat(
                 attempts.append((strict_nut, None))
             if tight_nut and tight_nut != strict_nut:
                 attempts.append((tight_nut, None))
-            nut_for_spread = tight_nut or strict_nut
-            cat = _random_category_count_targets(limits) or None
-            if cat is not None:
-                attempts.append((nut_for_spread, cat))
         attempts.append((None, None))
 
         if "model" not in _cpsat_model:
             build_err = _build_structural_model()
             if build_err or _cpsat_model.get("model") is None:
                 return None, build_err
+        relax_err = _ensure_relaxation_bounds()
+        if relax_err:
+            return None, relax_err
         model = _cpsat_model["model"]
         vars_by_slot = _cpsat_model["vars_by_slot"]
         present_by_ingredient = _cpsat_model["present_by_ingredient"]

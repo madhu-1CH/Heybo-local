@@ -39,6 +39,7 @@ class CpsatFillState:
     used_customization_max: bool = False
     companion_rejected_total: int = 0
     fill_count: int = 0
+    model_session: dict | None = None
 
 
 def _relaxation_fingerprint(
@@ -196,6 +197,8 @@ def run_heybo_cpsat_fill(
     if fingerprint == state.last_fingerprint:
         return 0
     state.last_fingerprint = fingerprint
+    if state.model_session is None:
+        state.model_session = {}
 
     existing_nf = list(
         user_input.get("NutrientFilters")
@@ -310,6 +313,7 @@ def run_heybo_cpsat_fill(
             cuisine_matched_names=cuisine_matched,
             only_exact_bowl=only_exact,
             customization_category_limits=customization_category_limits,
+            model_session=state.model_session,
         )
         if cpsat_msg and reason == "initial":
             global_validations.setdefault("filter_summary", []).append(cpsat_msg)
