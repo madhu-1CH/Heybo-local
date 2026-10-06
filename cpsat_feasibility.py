@@ -1810,12 +1810,20 @@ def search_feasible_bowls_cpsat(
         nutrient_filters = []
         dbg_print("[CP-SAT] Only exact: skipping nutrient / price / CO2e / Light-Hearty mins")
 
-    build_obj_terms: list[Any] = []
+    # One model per search. Retries switch bound assumptions and append forbids.
+    _cpsat_model: dict[str, Any] = {}
 
-    def _build_model(
-        nutrient_overrides: dict[str, tuple[float, float]] | None = None,
-        category_overrides: dict[str, tuple[int, int]] | None = None,
-    ):
+    def _enforce(ct, gate):
+        if gate is not None:
+            ct.OnlyEnforceIf(gate)
+        return ct
+
+    def _build_structural_model():
+        """Variables and constraints that do not change between retries.
+
+        Full nutrient bands and full category limits are hard constraints.
+        Tighter windows are added later behind assumption literals.
+        """
         model = cp_model.CpModel()
         vars_by_slot: dict[tuple[str, str], Any] = {}
         slots_by_ingredient: dict[str, list[Any]] = {}
@@ -1849,8 +1857,6 @@ def search_feasible_bowls_cpsat(
             model.Add(total == 0).OnlyEnforceIf(present.Not())
 
         for cat, (cmin, cmax) in limits.items():
-            if category_overrides and cat in category_overrides:
-                cmin, cmax = category_overrides[cat]
             if cat == "Proteins":
                 limit_min = int(limits.get(cat, (0, 0))[0])
                 cmin = max(int(cmin), limit_min)
@@ -1858,7 +1864,7 @@ def search_feasible_bowls_cpsat(
             cat_vars = vars_by_category.get(cat) or []
             if not cat_vars:
                 if cmin > 0:
-                    return None, None, None, None, (
+                    return (
                         f"CP-SAT infeasible: category '{cat}' requires min={cmin} but pool is empty"
                     )
                 continue
@@ -1893,18 +1899,17 @@ def search_feasible_bowls_cpsat(
             rng = nf.get("Range") or {}
             min_raw = rng.get("Min")
             max_raw = rng.get("Max")
-            if nutrient_overrides and key in nutrient_overrides:
-                min_raw, max_raw = nutrient_overrides[key]
             scaled_min, scaled_max = _scaled_nutrient_bounds(min_raw, max_raw, drift)
             coeff: list[tuple[Any, int]] = []
             for (_cat, ing), var in vars_by_slot.items():
                 scaled = _ingredient_nutrient_scaled(df, ing, key)
                 if scaled:
                     coeff.append((var, scaled))
+            _cpsat_model.setdefault("nutrient_coeff", {})[key] = coeff
             total_expr = sum(c * v for v, c in coeff) if coeff else 0
             if scaled_min is not None and float(min_raw or 0) > 0:
                 if not coeff:
-                    return None, None, None, None, (
+                    return (
                         f"CP-SAT infeasible: no menu ingredient contributes to {key} "
                         f"but Min={min_raw}"
                     )
@@ -1925,7 +1930,7 @@ def search_feasible_bowls_cpsat(
                 if grams:
                     weight_terms.append((var, grams))
             if not weight_terms and weight_lo is not None and weight_lo > 0:
-                return None, None, None, None, (
+                return (
                     "CP-SAT infeasible: Light/Hearty weight Min set but no ingredient weights in menu"
                 )
             weight_expr = sum(g * v for v, g in weight_terms) if weight_terms else 0
@@ -1940,7 +1945,7 @@ def search_feasible_bowls_cpsat(
                 if scaled:
                     co2e_terms.append((var, scaled))
             if co2e_min_scaled is not None and co2e_min_scaled > 0 and not co2e_terms:
-                return None, None, None, None, (
+                return (
                     "CP-SAT infeasible: Sustainable CO2e Min set but no CO2e data in menu pool"
                 )
             if co2e_terms:
@@ -1957,7 +1962,7 @@ def search_feasible_bowls_cpsat(
                 if cents:
                     price_terms.append((var, cents))
             if price_min_cents is not None and price_min_cents > 0 and not price_terms:
-                return None, None, None, None, (
+                return (
                     "CP-SAT infeasible: Price Min set but no ai_price data in menu pool"
                 )
             if price_terms:
@@ -1981,12 +1986,6 @@ def search_feasible_bowls_cpsat(
                 model.Add(present_by_ingredient[ing_a] + present_by_ingredient[ing_b] <= 1)
 
         obj_terms: list[Any] = []
-        apriori_preferred = _sample_apriori_preferred(apriori_candidates)
-        for cat, preferred in (apriori_preferred or {}).items():
-            for rank, name in enumerate(preferred):
-                if name in present_by_ingredient:
-                    weight = max(1, 3 - rank)
-                    obj_terms.append(weight * present_by_ingredient[name])
         true_preferred = true_cuisine_names | true_flavor_names | true_prep_names
         name_weights: dict[str, int] = {}
         for name in true_preferred | set(preferred_proteins or []):
@@ -2013,19 +2012,19 @@ def search_feasible_bowls_cpsat(
         if not only_exact_bowl and preferred_proteins:
             err = _require_at_least_one(preferred_proteins, "preferred protein")
             if err:
-                return None, None, None, None, err
+                return err
         if not only_exact_bowl and _cuisine_filters_requested(user_input):
             err = _require_at_least_one(true_cuisine_names or cuisine_match_names, "cuisine")
             if err:
-                return None, None, None, None, err
+                return err
         if not only_exact_bowl and _flavor_preferences_requested(user_input, flavor_preferences):
             err = _require_at_least_one(true_flavor_names or flavor_match_names, "flavor")
             if err:
-                return None, None, None, None, err
+                return err
         if not only_exact_bowl and _prep_method_requested(user_input):
             err = _require_at_least_one(true_prep_names or prep_match_names, "prep method")
             if err:
-                return None, None, None, None, err
+                return err
         pref_sauces: set[str] = set()
         if _cuisine_filters_requested(user_input):
             pref_sauces.update(true_cuisine_by_cat.get("Sauces") or [])
@@ -2042,23 +2041,178 @@ def search_feasible_bowls_cpsat(
         ):
             err = _require_at_least_one(pref_sauces, "cuisine/flavor/prep sauce")
             if err:
-                return None, None, None, None, err
+                return err
 
-        build_obj_terms.clear()
-        if obj_terms and not only_exact_bowl:
-            build_obj_terms.extend(obj_terms)
+        _cpsat_model["model"] = model
+        _cpsat_model["vars_by_slot"] = vars_by_slot
+        _cpsat_model["vars_by_category"] = vars_by_category
+        _cpsat_model["present_by_ingredient"] = present_by_ingredient
+        _cpsat_model["stable_obj_terms"] = obj_terms if not only_exact_bowl else []
+        _cpsat_model["bound_cache"] = {}
+        _cpsat_model["bound_gates"] = []
+        _cpsat_model["dead_bound_gates"] = []
+        _cpsat_model["div_gates"] = []
+        _cpsat_model["posted_forbids"] = set()
+        return None
 
-        return model, vars_by_slot, vars_by_category, present_by_ingredient, None
+    def _nutrient_coeff(key: str) -> list[tuple[Any, int]]:
+        cache = _cpsat_model.setdefault("nutrient_coeff", {})
+        if key in cache:
+            return cache[key]
+        coeff: list[tuple[Any, int]] = []
+        for (_cat, ing), var in _cpsat_model["vars_by_slot"].items():
+            scaled = _ingredient_nutrient_scaled(df, ing, key)
+            if scaled:
+                coeff.append((var, scaled))
+        cache[key] = coeff
+        return coeff
+
+    def _resolved_category_bounds(cat: str, cmin: int, cmax: int):
+        vars_by_category = _cpsat_model["vars_by_category"]
+        if cat == "Proteins":
+            limit_min = int(limits.get(cat, (0, 0))[0])
+            cmin = max(int(cmin), limit_min)
+            cmax = max(int(cmax), int(cmin))
+        cat_vars = vars_by_category.get(cat) or []
+        if not cat_vars:
+            if int(cmin) > 0:
+                return (
+                    f"CP-SAT infeasible: category '{cat}' requires min={cmin} but pool is empty"
+                )
+            return None
+        forced = sum(int(portion_req.get(ing, 0) or 0) for ing in (pools.get(cat) or []))
+        max_possible = sum(
+            max(1, int(portion_req.get(ing, 0) or 0)) for ing in (pools.get(cat) or [])
+        )
+        cmax = min(int(cmax), max_possible)
+        cmin = min(int(cmin), cmax)
+        if forced > cmax and not only_exact_bowl:
+            cmax = forced
+        cmin = max(int(cmin), forced)
+        cmin = min(cmin, cmax)
+        return int(cmin), int(cmax), cat_vars
+
+    def _add_tighter_nutrients(nutrient_overrides, gate) -> str | None:
+        if not nutrient_overrides:
+            return None
+        model = _cpsat_model["model"]
+        for key, (min_raw, max_raw) in nutrient_overrides.items():
+            scaled_min, scaled_max = _scaled_nutrient_bounds(min_raw, max_raw, drift)
+            coeff = _nutrient_coeff(key)
+            total_expr = sum(c * v for v, c in coeff) if coeff else 0
+            if scaled_min is not None and float(min_raw or 0) > 0:
+                if not coeff:
+                    return (
+                        f"CP-SAT infeasible: no menu ingredient contributes to {key} "
+                        f"but Min={min_raw}"
+                    )
+                _enforce(model.Add(total_expr >= scaled_min), gate)
+            if scaled_max is not None and coeff:
+                _enforce(model.Add(total_expr <= scaled_max), gate)
+        return None
+
+    def _add_tighter_categories(category_overrides, gate) -> str | None:
+        if not category_overrides:
+            return None
+        model = _cpsat_model["model"]
+        for cat, (cmin, cmax) in category_overrides.items():
+            resolved = _resolved_category_bounds(cat, cmin, cmax)
+            if resolved is None:
+                continue
+            if isinstance(resolved, str):
+                return resolved
+            lo, hi, cat_vars = resolved
+            _enforce(model.Add(sum(cat_vars) >= lo), gate)
+            _enforce(model.Add(sum(cat_vars) <= hi), gate)
+        return None
+
+    def _bounds_assumptions(nutrient_overrides, category_overrides):
+        if not nutrient_overrides and not category_overrides:
+            return [], None
+        nut_key = tuple(
+            sorted(
+                (str(k), float(v[0]), float(v[1]))
+                for k, v in (nutrient_overrides or {}).items()
+            )
+        )
+        cat_key = tuple(
+            sorted(
+                (str(k), int(v[0]), int(v[1]))
+                for k, v in (category_overrides or {}).items()
+            )
+        )
+        cache = _cpsat_model["bound_cache"]
+        key = (nut_key, cat_key)
+        if key in cache:
+            return cache[key]
+        model = _cpsat_model["model"]
+        gate = model.NewBoolVar(f"bounds:{len(cache)}")
+        err = _add_tighter_nutrients(nutrient_overrides, gate)
+        if err is None:
+            err = _add_tighter_categories(category_overrides, gate)
+        if err is not None:
+            _cpsat_model["dead_bound_gates"].append(gate)
+            cache[key] = ([], err)
+            return [], err
+        _cpsat_model["bound_gates"].append(gate)
+        cache[key] = ([gate], None)
+        return [gate], None
+
+    def _apriori_objective_terms() -> list[Any]:
+        present_by_ingredient = _cpsat_model["present_by_ingredient"]
+        obj_terms: list[Any] = []
+        apriori_preferred = _sample_apriori_preferred(apriori_candidates)
+        for _cat, preferred in (apriori_preferred or {}).items():
+            for rank, name in enumerate(preferred):
+                if name in present_by_ingredient:
+                    weight = max(1, 3 - rank)
+                    obj_terms.append(weight * present_by_ingredient[name])
+        return obj_terms
+
+    def _append_forbidden_sets() -> None:
+        model = _cpsat_model["model"]
+        present_by_ingredient = _cpsat_model["present_by_ingredient"]
+        posted = _cpsat_model["posted_forbids"]
+        for chosen in chosen_sets:
+            present = [ing for ing in chosen if ing in present_by_ingredient]
+            if not present:
+                continue
+            key = tuple(present)
+            if key in posted:
+                continue
+            posted.add(key)
+            model.Add(
+                sum(present_by_ingredient[ing] for ing in present) <= len(present) - 1
+            )
+
+    def _active_assumptions(bound_lits, div_gate) -> list[Any]:
+        active = set(bound_lits)
+        lits = list(bound_lits)
+        lits.append(div_gate)
+        for gate in _cpsat_model["bound_gates"]:
+            if gate not in active:
+                lits.append(gate.Not())
+        for gate in _cpsat_model["dead_bound_gates"]:
+            lits.append(gate.Not())
+        for gate in _cpsat_model["div_gates"]:
+            lits.append(gate.Not())
+        return lits
 
     def _forbid_protein_sauce_pair(
         model,
         present_by_ingredient: dict[str, Any],
         protein: str,
         sauce: str,
+        gate=None,
     ) -> None:
         if protein and sauce:
             if protein in present_by_ingredient and sauce in present_by_ingredient:
-                model.Add(present_by_ingredient[protein] + present_by_ingredient[sauce] <= 1)
+                _enforce(
+                    model.Add(
+                        present_by_ingredient[protein] + present_by_ingredient[sauce] <= 1
+                    ),
+                    gate,
+                )
 
     def _apply_diversity(
         model,
@@ -2067,7 +2221,11 @@ def search_feasible_bowls_cpsat(
         unique_ps: bool,
         used_ps: list[tuple[str, str]],
         chosen_sets: list[list[str]],
+        gate=None,
     ) -> list[Any]:
+        def _add(ct):
+            return _enforce(ct, gate)
+
         diversity_obj: list[Any] = []
         if unique_ps:
             used_proteins = {p for p, _s in used_ps if p}
@@ -2090,7 +2248,7 @@ def search_feasible_bowls_cpsat(
                     if name in few_forced_names or name in force_on_set:
                         continue
                     if name in rotate_proteins and name in present_by_ingredient:
-                        model.Add(present_by_ingredient[name] == 0)
+                        _add(model.Add(present_by_ingredient[name] == 0))
                         forbade_protein = True
                 if forbade_protein:
                     dbg_print(
@@ -2129,7 +2287,7 @@ def search_feasible_bowls_cpsat(
                     if name in few_forced_names or name in force_on_set:
                         continue
                     if name in rotate_sauces and name in present_by_ingredient:
-                        model.Add(present_by_ingredient[name] == 0)
+                        _add(model.Add(present_by_ingredient[name] == 0))
                 rotated_sauces = True
 
             if few_forced_sauces and not rotated_sauces:
@@ -2139,7 +2297,9 @@ def search_feasible_bowls_cpsat(
                 )
             elif not rotated_proteins and not rotated_sauces:
                 for protein, sauce in used_ps:
-                    _forbid_protein_sauce_pair(model, present_by_ingredient, protein, sauce)
+                    _forbid_protein_sauce_pair(
+                        model, present_by_ingredient, protein, sauce, gate=gate
+                    )
 
         # Variety: without NutrientFilters, rotate fillers by forbidding used
         # names. With NutrientFilters, never force a swap — Maximize unused
@@ -2203,14 +2363,8 @@ def search_feasible_bowls_cpsat(
             )
             for name in used_fillers:
                 if name in present_by_ingredient:
-                    model.Add(present_by_ingredient[name] == 0)
+                    _add(model.Add(present_by_ingredient[name] == 0))
 
-        for chosen in chosen_sets:
-            present = [ing for ing in chosen if ing in present_by_ingredient]
-            if present:
-                model.Add(
-                    sum(present_by_ingredient[ing] for ing in present) <= len(present) - 1
-                )
         return diversity_obj
 
     def _accept_solution(solver, vars_by_slot):
@@ -2321,15 +2475,26 @@ def search_feasible_bowls_cpsat(
                 attempts.append((nut_for_spread, cat))
         attempts.append((None, None))
 
+        if "model" not in _cpsat_model:
+            build_err = _build_structural_model()
+            if build_err or _cpsat_model.get("model") is None:
+                return None, build_err
+        model = _cpsat_model["model"]
+        vars_by_slot = _cpsat_model["vars_by_slot"]
+        present_by_ingredient = _cpsat_model["present_by_ingredient"]
+
         for nut_overrides, cat_overrides in attempts:
+            bound_lits, bound_err = _bounds_assumptions(nut_overrides, cat_overrides)
+            if bound_err:
+                if nut_overrides is None and cat_overrides is None:
+                    return None, bound_err
+                break
             for _retry in range(6):
-                model, vars_by_slot, vars_by_category, present_by_ingredient, build_err = (
-                    _build_model(nut_overrides, cat_overrides)
-                )
-                if build_err or model is None:
-                    if nut_overrides is None and cat_overrides is None and _retry == 0:
-                        return None, build_err
-                    break
+                _append_forbidden_sets()
+                apriori_terms = _apriori_objective_terms()
+                if only_exact_bowl:
+                    apriori_terms = []
+                div_gate = model.NewBoolVar(f"div:{len(_cpsat_model['div_gates'])}:{_retry}")
                 extra_obj = _apply_diversity(
                     model,
                     vars_by_slot,
@@ -2337,10 +2502,20 @@ def search_feasible_bowls_cpsat(
                     unique_ps=unique_ps,
                     used_ps=used_ps,
                     chosen_sets=chosen_sets,
+                    gate=div_gate,
                 )
-                combined_obj = list(build_obj_terms) + list(extra_obj or [])
+                combined_obj = (
+                    list(_cpsat_model["stable_obj_terms"])
+                    + apriori_terms
+                    + list(extra_obj or [])
+                )
                 if combined_obj and not only_exact_bowl:
                     model.Maximize(sum(combined_obj))
+                else:
+                    model.ClearObjective()
+                model.ClearAssumptions()
+                model.AddAssumptions(_active_assumptions(bound_lits, div_gate))
+                _cpsat_model["div_gates"].append(div_gate)
                 solver.parameters.random_seed = random.randint(1, 2_000_000_000)
                 status = solver.Solve(model)
                 used_spread = nut_overrides is not None or cat_overrides is not None
