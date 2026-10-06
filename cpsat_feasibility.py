@@ -2484,12 +2484,15 @@ def search_feasible_bowls_cpsat(
         present_by_ingredient = _cpsat_model["present_by_ingredient"]
 
         for nut_overrides, cat_overrides in attempts:
+            # Up to 3 tries after a post-check reject. The rejected set is forbidden
+            # first. An infeasible window stops on the first solve and the next
+            # wider window is still tried.
             bound_lits, bound_err = _bounds_assumptions(nut_overrides, cat_overrides)
             if bound_err:
                 if nut_overrides is None and cat_overrides is None:
                     return None, bound_err
                 break
-            for _retry in range(6):
+            for _retry in range(3):
                 _append_forbidden_sets()
                 apriori_terms = _apriori_objective_terms()
                 if only_exact_bowl:
@@ -2526,6 +2529,11 @@ def search_feasible_bowls_cpsat(
                 bowl, selection, chosen = _accept_solution(solver, vars_by_slot)
                 if bowl is None:
                     if chosen:
+                        chosen_sets.append(list(chosen))
+                        dbg_print(
+                            "[CP-SAT] post-accept reject; forbidding set and retrying "
+                            f"(retry={_retry + 1})"
+                        )
                         continue
                     if used_spread:
                         spread_fallbacks += 1
