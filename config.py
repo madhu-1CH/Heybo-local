@@ -26,8 +26,9 @@ load_dotenv(override=False)
 CPSAT_ENABLED = True
 CPSAT_MAX_SOLUTIONS = 5
 CPSAT_TIME_LIMIT_SECONDS = 15.0
-# OR-Tools threads per solve (one request). Same value in UAT and prod.
-CPSAT_SEARCH_WORKERS = 8
+# OR-Tools threads per solve. 1 leaves the 16 vCPUs of ml.m5.4xlarge for
+# many chatbot requests at once. Same value in UAT and prod.
+CPSAT_SEARCH_WORKERS = 1
 
 DEBUG_ENABLED = os.getenv("DEBUG", "False").lower() in ("true", "1", "yes", "on")
 
