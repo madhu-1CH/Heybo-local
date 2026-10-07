@@ -80,7 +80,8 @@ _WEIGHT_TRIM_SLACK_G = 80
 
 _CO2E_SCALE = 100
 _PRICE_DRIFT_CENTS = 50
-_PRICE_RELAXATION_SLACKS = (0.5, 1.0, 2.0, 5.0)
+# First pass $0.50, then +$1 … +$6, then the maximum is removed. Matches generation.py.
+_PRICE_RELAXATION_SLACKS = (0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
 _CO2_RELAXATION_LEVEL_1_MAX = 1.80
 _MIN_TOTAL_SIDES_NORMAL = 3
 
@@ -1113,9 +1114,14 @@ def _effective_price_bounds(user_input: dict) -> tuple[float | None, float | Non
         return None, None
     a = float(min_p) if min_p is not None else None
     b = float(max_p) if max_p is not None else None
-    idx = min(int(user_input.get("price_relaxation_level") or 0), len(_PRICE_RELAXATION_SLACKS) - 1)
-    slack = _PRICE_RELAXATION_SLACKS[idx]
-    if a is not None and b is not None and round(a, 2) == round(b, 2):
+    step = int(user_input.get("price_relaxation_level") or 0)
+    equal_target = a is not None and b is not None and round(a, 2) == round(b, 2)
+    if step >= len(_PRICE_RELAXATION_SLACKS):
+        if equal_target:
+            return None, None
+        return a, None
+    slack = float(_PRICE_RELAXATION_SLACKS[step])
+    if equal_target:
         return a - slack, a + slack
     lo, hi = a, b
     if lo is not None:

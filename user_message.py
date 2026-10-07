@@ -15,7 +15,8 @@ from .nutrition_constraints import DIET_TO_NUTRIENT_MAP
 # Must match `heybo.generation.HEYBO_BOWLS_PER_PAGE` (avoid importing generation → circular import).
 _HEYBO_BYB_FULL_PAGE = 5
 # Must match `heybo.generation.PRICE_RELAXATION_SLACKS`.
-_HEYBO_PRICE_RELAXATION_SLACKS = (0.5, 1.0, 2.0, 5.0)
+# First pass $0.50, then +$1 … +$6. The next level removes the maximum.
+_HEYBO_PRICE_RELAXATION_SLACKS = (0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
 
 
 # Shown when Only BYB generates a single bowl (legacy / partial page).

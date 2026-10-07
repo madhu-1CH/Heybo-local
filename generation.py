@@ -519,9 +519,22 @@ def _heybo_apply_balanced_override(user_input: dict, global_validations: dict) -
     return True
 
 
-# Price filter: if Min and Max are the same dollar amount, treat as a target and allow ±slack (discrete bowl costs).
-# After 40 misses, relaxation_idx steps up and slack grows. Same slacks widen a real range (min−slack, max+slack).
-PRICE_RELAXATION_SLACKS = (0.5, 1.0, 2.0, 5.0)
+# Price filter: the first pass allows $0.50 (discrete bowl costs, no .50/.90 rounding).
+# After repeated misses the maximum rises by $1 at a time for six steps ($1 … $6),
+# matching Saladstop. The next step removes the maximum.
+PRICE_RELAXATION_SLACKS = (0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
+
+
+def _heybo_price_slack(relaxation_idx: int) -> float:
+    """Dollars added to the asked maximum. Past the last step, the cap is off."""
+    step = int(relaxation_idx or 0)
+    if step >= len(PRICE_RELAXATION_SLACKS):
+        return float("inf")
+    return float(PRICE_RELAXATION_SLACKS[step])
+
+
+def _heybo_price_cap_removed(relaxation_idx: int) -> bool:
+    return int(relaxation_idx or 0) >= len(PRICE_RELAXATION_SLACKS)
 
 
 def _heybo_user_requested_price_bounds(user_input):
@@ -571,19 +584,23 @@ def _heybo_flag_most_bowls_outside_price_range(heybo_bowls, user_input, price_re
 def _effective_price_bounds(min_p, max_p, relaxation_idx):
     """
     Return (eff_min, eff_max) for generation filtering.
-    Heybo has no .50/.90 price rounding — only ±slack from ``PRICE_RELAXATION_SLACKS``.
-    Equal Min/Max is treated as a target: always ±slack at the current relaxation step.
+    The first pass allows $0.50. Later steps raise the maximum by $1 … $6.
+    The step after that removes the maximum. Equal Min/Max stays a ± target
+    until the cap comes off.
     """
     if min_p is None and max_p is None:
         return None, None
     a = float(min_p) if min_p is not None else None
     b = float(max_p) if max_p is not None else None
-    idx = min(relaxation_idx, len(PRICE_RELAXATION_SLACKS) - 1)
-    slack = PRICE_RELAXATION_SLACKS[idx]
+    slack = _heybo_price_slack(relaxation_idx)
+    equal_target = a is not None and b is not None and round(a, 2) == round(b, 2)
+    if slack == float("inf"):
+        if equal_target:
+            return None, None
+        return a, None
 
-    if a is not None and b is not None and round(a, 2) == round(b, 2):
-        t = a
-        return t - slack, t + slack
+    if equal_target:
+        return a - slack, a + slack
 
     lo, hi = a, b
     if lo is not None:
@@ -1277,7 +1294,7 @@ def _heybo_price_level_for_needed_headroom(needed: float) -> int:
     for i, slack in enumerate(PRICE_RELAXATION_SLACKS):
         if float(slack) + 1e-9 >= need:
             return i
-    return len(PRICE_RELAXATION_SLACKS) - 1
+    return len(PRICE_RELAXATION_SLACKS)
 
 
 def _heybo_fill_bowl_joint_constraints(
@@ -3071,6 +3088,31 @@ def generate_heybo_bowls(user_input):
         # (need Extra protein / more slots). Count these so price relaxes before nutrient.
         failed_min_under_budget_attempts = 0
         price_relaxation_level = 0
+        _heybo_base_price = (heybo_cfg.get("price_config") or {}).get("base_price")
+        _heybo_price_filter = user_input.get("Price") if isinstance(user_input.get("Price"), dict) else {}
+        _heybo_asked_max = _heybo_price_filter.get("Max") if isinstance(_heybo_price_filter, dict) else None
+        if (
+            _heybo_base_price is not None
+            and _heybo_asked_max is not None
+            and float(_heybo_asked_max) < float(_heybo_base_price)
+        ):
+            # Budget is below BYB_Min_Price. Search at that base price.
+            # Other filters still relax in priority order if this price cannot fill the page.
+            user_input["_below_base_price"] = True
+            user_input["_min_possible_price_for_bowl"] = float(_heybo_base_price)
+            _orig_price = user_input.get("_price_original_before_snap") or {}
+            _budget_display = (
+                _orig_price.get("Max")
+                if isinstance(_orig_price, dict) and _orig_price.get("Max") is not None
+                else _heybo_asked_max
+            )
+            global_validations["price_minimum_violation"] = [
+                "Note: We've generated bowls at the minimum price of "
+                f"${float(_heybo_base_price):.2f} "
+                f"(your budget was ${float(_budget_display):.2f}). "
+                "This is the lowest possible price for this bowl type."
+            ]
+            user_input["Price"] = {**_heybo_price_filter, "Max": float(_heybo_base_price)}
         failed_light_hearty_attempts = 0
         light_hearty_relaxation_level = user_input.get("light_hearty_relaxation_level", 0)
         if not isinstance(light_hearty_relaxation_level, int) or light_hearty_relaxation_level < 0:
@@ -4989,15 +5031,23 @@ def generate_heybo_bowls(user_input):
                     if (
                         (_pmin is not None or _pmax is not None)
                         and _price_fail_ready
-                        and price_relaxation_level < len(PRICE_RELAXATION_SLACKS) - 1
+                        and price_relaxation_level < len(PRICE_RELAXATION_SLACKS)
                     ):
                         failed_price_attempts = 0
                         failed_min_under_budget_attempts = 0
                         price_relaxation_level += 1
-                        global_validations["filter_summary"].append(
-                            "Progressive relaxation: widened price filter band after repeated misses "
-                            f"(step {price_relaxation_level}, ±${PRICE_RELAXATION_SLACKS[price_relaxation_level]:.2f})"
-                        )
+                        if _heybo_price_cap_removed(price_relaxation_level):
+                            _price_step_msg = (
+                                "Progressive relaxation: removed the price maximum "
+                                "after repeated misses"
+                            )
+                        else:
+                            _price_step_msg = (
+                                "Progressive relaxation: widened price filter band after repeated misses "
+                                f"(step {price_relaxation_level}, "
+                                f"+${PRICE_RELAXATION_SLACKS[price_relaxation_level]:.2f})"
+                            )
+                        global_validations["filter_summary"].append(_price_step_msg)
                         print(
                             f"[CONSTRAINT-FIRST] progressive price relax "
                             f"level={price_relaxation_level}"
@@ -5378,7 +5428,7 @@ def generate_heybo_bowls(user_input):
                             _chase_binding_mins
                             and len(heybo_bowls) == 0
                             and _pf_now.get("Max") is not None
-                            and price_relaxation_level < len(PRICE_RELAXATION_SLACKS) - 1
+                            and price_relaxation_level < len(PRICE_RELAXATION_SLACKS)
                         ):
                             failed_min_under_budget_attempts += 1
                         # Hard Max band (e.g. calories ≤300) + floor price: free-tier bowls
@@ -5388,7 +5438,7 @@ def generate_heybo_bowls(user_input):
                             _over_max_early
                             and len(heybo_bowls) == 0
                             and _pf_now.get("Max") is not None
-                            and price_relaxation_level < len(PRICE_RELAXATION_SLACKS) - 1
+                            and price_relaxation_level < len(PRICE_RELAXATION_SLACKS)
                         ):
                             failed_price_attempts += 1
                         # When LH is active and the failing nutrient is one that is
@@ -5416,17 +5466,24 @@ def generate_heybo_bowls(user_input):
                             len(heybo_bowls) == 0
                             and _chase_binding_mins
                             and _pf_now.get("Max") is not None
-                            and price_relaxation_level < len(PRICE_RELAXATION_SLACKS) - 1
+                            and price_relaxation_level < len(PRICE_RELAXATION_SLACKS)
                             and failed_min_under_budget_attempts >= 40
                         ):
                             price_relaxation_level += 1
                             failed_min_under_budget_attempts = 0
                             failed_price_attempts = 0
-                            global_validations["filter_summary"].append(
-                                "Progressive relaxation: widened price after repeated Min misses "
-                                f"under requested budget (step {price_relaxation_level}, "
-                                f"±${PRICE_RELAXATION_SLACKS[price_relaxation_level]:.2f})"
-                            )
+                            if _heybo_price_cap_removed(price_relaxation_level):
+                                _min_price_msg = (
+                                    "Progressive relaxation: removed the price maximum "
+                                    "after repeated Min misses under the requested budget"
+                                )
+                            else:
+                                _min_price_msg = (
+                                    "Progressive relaxation: widened price after repeated Min misses "
+                                    f"under requested budget (step {price_relaxation_level}, "
+                                    f"+${PRICE_RELAXATION_SLACKS[price_relaxation_level]:.2f})"
+                                )
+                            global_validations["filter_summary"].append(_min_price_msg)
                             print(
                                 f"[CONSTRAINT-FIRST] progressive price relax after Min misses "
                                 f"level={price_relaxation_level}"
@@ -5500,7 +5557,7 @@ def generate_heybo_bowls(user_input):
                         )
                         _price_done = (
                             _pf_now.get("Max") is None
-                            or price_relaxation_level >= len(PRICE_RELAXATION_SLACKS) - 1
+                            or _heybo_price_cap_removed(price_relaxation_level)
                         )
                         _prep_done = (not prep_active) or prep_relaxation_enabled
                         _cuisine_done = (not cuisine_active) or cuisine_relaxation_enabled
@@ -6047,6 +6104,35 @@ def generate_heybo_bowls(user_input):
         global_validations["nutrient_relaxation_active_keys"] = list(
             user_input["nutrient_relaxation_active_keys"]
         )
+        if user_input.get("_below_base_price") and heybo_bowls:
+            _floor = float(user_input.get("_min_possible_price_for_bowl") or 0)
+            _costs = []
+            for _bowl in heybo_bowls:
+                try:
+                    _costs.append(float(_bowl.get("Total Cost")))
+                except (TypeError, ValueError):
+                    continue
+            _orig_price = user_input.get("_price_original_before_snap") or {}
+            _budget = (
+                _orig_price.get("Max")
+                if isinstance(_orig_price, dict) and _orig_price.get("Max") is not None
+                else None
+            )
+            if _costs and _budget is not None:
+                _lo, _hi = min(_costs), max(_costs)
+                if abs(_lo - _hi) < 0.01:
+                    _price_msg = (
+                        f"Note: We've generated {len(heybo_bowls)} bowls at the minimum price of "
+                        f"${_lo:.2f} (your budget was ${float(_budget):.2f}). "
+                        "This is the lowest possible price for this bowl type."
+                    )
+                else:
+                    _price_msg = (
+                        f"Note: We've generated {len(heybo_bowls)} bowls priced between "
+                        f"${_lo:.2f} and ${_hi:.2f} (your budget was ${float(_budget):.2f}). "
+                        f"The minimum possible price for this bowl type is ${_floor:.2f}."
+                    )
+                global_validations["price_minimum_violation"] = [_price_msg]
         msg = build_heybo_message_to_user(
             heybo_bowls,
             global_validations,
