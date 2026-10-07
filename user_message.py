@@ -634,6 +634,11 @@ def _heybo_relaxation_omit_from_opener(ui: dict) -> Set[str]:
         omit.add("price")
     if ui.get("_costlier_bowls_capped") or ui.get("_most_bowls_outside_price_range"):
         omit.add("price")
+    # The minimum-price Note already states the budget and the floor. The working
+    # Price Max has been rewritten to that floor, so listing it here reads as the ask.
+    gv = ui.get("global_validations") or {}
+    if gv.get("price_minimum_violation"):
+        omit.add("price")
     return omit
 
 
