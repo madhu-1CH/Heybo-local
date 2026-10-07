@@ -25,7 +25,8 @@ load_dotenv(override=False)
 # CP-SAT first-pass search for CYO (not Signatures). Random generation remains the fallback.
 CPSAT_ENABLED = True
 CPSAT_MAX_SOLUTIONS = 5
-CPSAT_TIME_LIMIT_SECONDS = 15.0
+# Seconds for one CP-SAT search. A request can start several searches.
+CPSAT_TIME_LIMIT_SECONDS = 3.0
 # OR-Tools threads per solve. 1 leaves the 16 vCPUs of ml.m5.4xlarge for
 # many chatbot requests at once. Same value in UAT and prod.
 CPSAT_SEARCH_WORKERS = 1

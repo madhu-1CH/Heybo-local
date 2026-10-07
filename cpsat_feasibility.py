@@ -1540,7 +1540,7 @@ def search_feasible_bowls_cpsat(
     exclude_list: list[str] | None = None,
     omit_categories: set[str] | None = None,
     max_solutions: int = 5,
-    time_limit_seconds: float = 15.0,
+    time_limit_seconds: float = 3.0,
     expand_to_customization_max: bool = False,
     weight_range: tuple[float, float] | None = None,
     previous_bowls: set | None = None,
@@ -2529,7 +2529,7 @@ def search_feasible_bowls_cpsat(
         return bowl, selection, chosen
 
     solver = cp_model.CpSolver()
-    per_solve_limit = min(float(time_limit_seconds), 3.0)
+    per_solve_limit = float(time_limit_seconds)
     solver.parameters.max_time_in_seconds = per_solve_limit
     solver.parameters.num_search_workers = CPSAT_SEARCH_WORKERS
 
